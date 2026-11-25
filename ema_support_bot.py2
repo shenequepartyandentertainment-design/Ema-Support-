@@ -1,0 +1,165 @@
+"""
+Day-trading alert bot: 9 EMA / 21 EMA / VWAP.
+
+1) BUY / SELL setups (EMA crossover + confirmation candle)
+2) Support / resistance touch alerts at the 9 EMA, 21 EMA and VWAP
+3) Option contract idea attached to each BUY / SELL alert
+
+Alerts are sent to Telegram.
+"""
+import os
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
+import yfinance as yf
+
+# ---- CONFIG -----------------------------------------------------------
+TICKERS = ["MU", "SPY", "^GSPC", "SOXS", "TSLA", "AVGO", "NVDA", "META"]  # ^GSPC = SPX
+INTERVAL = "5m"            # "1m", "2m", "5m", "15m", "30m", "60m"
+USE_VWAP_FILTER = True     # buy only if entry closes above VWAP, sell only if below
+LEVEL_ALERTS = True        # also alert on support/resistance touches
+TOLERANCE = 0.0015         # touch = within 0.15% of the level
+COOLDOWN_MINUTES = 15      # min gap between repeat level alerts
+CHECK_EVERY_SECONDS = 30
+OPTION_IDEAS = True        # add a call/put contract idea to BUY/SELL alerts
+MIN_DAYS_TO_EXPIRY = 0     # 0 = nearest expiry (can be 0DTE), 1 = skip 0DTE, 7 = ~1 week out
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# -----------------------------------------------------------------------
+
+NY = ZoneInfo("America/New_York")
+BAR = timedelta(minutes=int(INTERVAL.replace("m", "")))
+sent_signals = set()   # (ticker, side, entry_bar_time)
+last_level_alert = {}  # (ticker, level, kind) -> datetime
+OPTION_SYMBOL = {"^GSPC": "^SPX"}  # Yahoo lists SPX options under ^SPX
+INVERSE = {"SOXS"}                 # inverse ETFs: a BUY here is bearish on semis
+LEVELS = {"ema9": "9 EMA", "ema21": "21 EMA", "vwap": "VWAP"}
+
+
+def market_open() -> bool:
+    now = datetime.now(NY)
+    if now.weekday() >= 5:
+        return False
+    return now.replace(hour=9, minute=30, second=0) <= now <= now.replace(hour=16, minute=0, second=0)
+
+
+def send(msg: str) -> None:
+    print(msg, "\n")
+    if not TOKEN or not CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        print("Telegram error:", e)
+
+
+def load(ticker: str):
+    df = yf.Ticker(ticker).history(period="5d", interval=INTERVAL)
+    if len(df) < 40:
+        return None
+    df.index = df.index.tz_convert(NY)
+    df["ema9"] = df["Close"].ewm(span=9, adjust=False).mean()
+    df["ema21"] = df["Close"].ewm(span=21, adjust=False).mean()
+    # VWAP resets every trading day (NaN for indexes with no volume, e.g. ^GSPC)
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    day = df.index.date
+    cum_pv = (typical * df["Volume"]).groupby(day).cumsum()
+    cum_v = df["Volume"].groupby(day).cumsum()
+    df["vwap"] = cum_pv / cum_v.where(cum_v > 0)
+    return df
+
+
+def option_hint(ticker: str, side: str, price: float) -> str:
+    """Nearest at-the-money call (BUY) or put (SELL) for the chosen expiry."""
+    try:
+        t = yf.Ticker(OPTION_SYMBOL.get(ticker, ticker))
+        exps = t.options
+        if not exps:
+            return ""
+        earliest = (datetime.now(NY).date() + timedelta(days=MIN_DAYS_TO_EXPIRY)).isoformat()
+        exp = next((e for e in exps if e >= earliest), exps[-1])
+        chain = t.option_chain(exp)
+        table = chain.calls if side == "BUY" else chain.puts
+        row = table.iloc[(table["strike"] - price).abs().argsort().iloc[0]]
+        kind = "CALL" if side == "BUY" else "PUT"
+        return (f"\nOption idea: {kind} {row['strike']:g} exp {exp}"
+                f"\nBid {row['bid']:.2f} / Ask {row['ask']:.2f} / Last {row['lastPrice']:.2f}")
+    except Exception as e:
+        print(f"{ticker} option lookup error: {e}")
+        return ""
+
+
+def check_setups(ticker: str, df: pd.DataFrame, now: datetime) -> None:
+    done = df[df.index + BAR <= now]          # completed candles only
+    if len(done) < 3:
+        return
+    a, b, c = done.iloc[-3], done.iloc[-2], done.iloc[-1]  # pre-cross, cross, entry
+    if now - c.name > BAR * 3 or b.name.date() != c.name.date():
+        return
+
+    buy = a.ema9 <= a.ema21 and b.ema9 > b.ema21 and c.Close > max(c.ema9, c.ema21)
+    sell = a.ema9 >= a.ema21 and b.ema9 < b.ema21 and c.Close < min(c.ema9, c.ema21)
+
+    if USE_VWAP_FILTER and not pd.isna(c.vwap):
+        buy = buy and c.Close > c.vwap
+        sell = sell and c.Close < c.vwap
+
+    for side, hit in (("BUY", buy), ("SELL", sell)):
+        key = (ticker, side, c.name)
+        if hit and key not in sent_signals:
+            sent_signals.add(key)
+            icon = "🟢" if side == "BUY" else "🔴"
+            vw = f"{c.vwap:.2f}" if not pd.isna(c.vwap) else "n/a"
+            note = " (inverse ETF)" if ticker in INVERSE else ""
+            opt = option_hint(ticker, side, float(c.Close)) if OPTION_IDEAS else ""
+            send(f"{icon} {ticker}{note} {side} setup ({INTERVAL})\n"
+                 f"Entry candle closed: ${c.Close:.2f} ({c.name:%H:%M} ET)\n"
+                 f"9 EMA {c.ema9:.2f} | 21 EMA {c.ema21:.2f} | VWAP {vw}{opt}")
+
+
+def check_levels(ticker: str, df: pd.DataFrame, now: datetime) -> None:
+    live, prev = df.iloc[-1], df.iloc[-2]
+    for col, label in LEVELS.items():
+        lvl = live[col]
+        if pd.isna(lvl):
+            continue
+        support = (prev.Close > prev[col] and live.Low <= lvl * (1 + TOLERANCE)
+                   and live.Close >= lvl * (1 - TOLERANCE))
+        resistance = (prev.Close < prev[col] and live.High >= lvl * (1 - TOLERANCE)
+                      and live.Close <= lvl * (1 + TOLERANCE))
+        for kind, hit in (("support", support), ("resistance", resistance)):
+            key = (ticker, col, kind)
+            last = last_level_alert.get(key)
+            if hit and (last is None or now - last >= timedelta(minutes=COOLDOWN_MINUTES)):
+                last_level_alert[key] = now
+                send(f"📍 {ticker} testing {label} as {kind} ({INTERVAL})\n"
+                     f"Price: ${live.Close:.2f} | {label}: ${lvl:.2f}")
+
+
+def main() -> None:
+    send(f"Bot started ({INTERVAL}). Watching: {', '.join(TICKERS)}")
+    while True:
+        if market_open():
+            now = datetime.now(NY)
+            for t in TICKERS:
+                try:
+                    df = load(t)
+                    if df is None:
+                        continue
+                    check_setups(t, df, now)
+                    if LEVEL_ALERTS:
+                        check_levels(t, df, now)
+                except Exception as e:
+                    print(f"{t} error: {e}")
+        time.sleep(CHECK_EVERY_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
