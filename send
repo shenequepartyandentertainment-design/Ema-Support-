@@ -1,0 +1,8 @@
+def send(msg: str) -> None:
+    print(msg, "\n")
+    if not WEBHOOK_URL:
+        return
+    try:
+        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
+    except requests.RequestException as e:
+        print("Discord error:", e)
